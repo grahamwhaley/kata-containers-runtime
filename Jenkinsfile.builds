@@ -1,0 +1,113 @@
+//
+// Copyright (c) 2019 Intel Corporation
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+pipeline {
+
+  parameters {
+    // Do we need 'sudo' inside a container node?
+    string(name: 'sudo', defaultValue: 'sudo', description: 'to sudo or not')
+  }
+
+  // Only run the static checks on an Ubuntu 18.04 agent
+  agent { label "ubuntu1804_azure" }
+  // We should be able to test this a container, as it is just the static checks
+  //agent { label "aci-azure-image" }
+
+  // Set up some required environment vars
+  environment {
+    // Golang variables:
+    GOPATH="${WORKSPACE}/go"
+    PATH="${GOPATH}/bin:/usr/local/go/bin:/usr/sbin:/sbin:${PATH}"
+
+    // Kata related variables:
+    CI="true"
+    // We need the tests repo to run the CI scripts
+    tests_repo="github.com/kata-containers/tests"
+    tests_repo_dir="${GOPATH}/src/${tests_repo}"
+    // We need the runtime repo to get the latest kata versions.yaml file to ensure
+    // we install and test with the required tool versions.
+    runtime_repo="github.com/kata-containers/runtime"
+    runtime_repo_dir="${GOPATH}/src/${runtime_repo}"
+  }
+
+  stages {
+
+    stage('Clean workspace') {
+      steps {
+        cleanWs()
+      }
+    }
+
+    stage('Setup base distro tools') {
+      steps {
+        echo "Showing the env"
+        sh 'env'
+        echo "Showing the id"
+        sh 'id'
+        echo "Updating distro"
+        //sh 'sudo apt update -y -qq'
+        sh "${params.sudo} apt update -y -qq"
+        echo "Installing curl"
+        sh "${params.sudo} apt install -y -qq curl"
+        sh "${params.sudo} apt install -y -qq git"
+      }
+    }
+
+    // We need to git clone the tests repo so we can use some of its CI scripts
+    // to help with some further setup, such as getting the correct golang version.
+    stage('Setup test repo environment') {
+      steps {
+        sh '''
+          git clone "https://${tests_repo}.git" "${tests_repo_dir}"
+          git clone "https://${runtime_repo}.git" "${runtime_repo_dir}"
+        '''
+      }
+    }
+
+    stage('Install Golang') {
+      steps {
+        dir("${GOPATH}/src/${tests_repo}") {
+            //"${GOPATH}/src/${tests_repo}/.ci/install_go.sh" -p -f
+          sh '''
+          ".ci/install_go.sh" -p -f
+          go version
+          '''
+        }
+      }
+    }
+
+    stage('Static Checks') {
+      steps {
+        // FIXME - this should probably be the path to the repo under test
+        dir("${GOPATH}/src/${runtime_repo}") {
+          echo "Running static checks"
+          sh '.ci/static-checks.sh'
+        }
+      }
+    }
+
+    stage('Build') {
+      steps {
+        // FIXME - this should probably be the path to the repo under test
+        dir("${GOPATH}/src/${runtime_repo}") {
+          echo "Performing a build"
+          sh 'pwd'
+          sh 'make'
+        }
+      }
+    }
+
+    stage('Install') {
+      steps {
+        // FIXME - this should probably be the path to the repo under test
+        dir("${GOPATH}/src/${runtime_repo}") {
+          echo "Performing an install"
+          sh 'sudo -E PATH=$PATH make install'
+        }
+      }
+    }
+  }
+}

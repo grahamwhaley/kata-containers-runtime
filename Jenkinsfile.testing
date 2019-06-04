@@ -1,0 +1,168 @@
+// // Copyright (c) 2019 Intel Corporation
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Kata Containers Jenkins CI pipeline.
+// Written in Jenkins Declarative pipeline style.
+//
+// Prereqs:
+//  In order to use the 'readJSON' function, this pipeline requires the
+//  'pipeline-utility-steps' plugin to be installed.
+//
+//  If you wish to use the 'rebuild' plugin with this pipeline, you may
+//  need to enable passing 'null' env vars through to rebuilds by executing
+//  the following in your Jenkins master script console:
+//  System.setProperty("hudson.model.ParametersAction.keepUndefinedParameters", "true")
+//
+//  In order to curl from the github API and not run into rate limiting issues,
+//  you should lodge your github access token in your Jenkins master keystore
+//  under the name **FIXME** 'github'.
+
+// Setting 'SKIPTESTS' to 'true' will skip later steps of the pipeline.
+// Used to short-circuit *pass* the CI. e.g., if the script finds a
+// github label of 'skip-ci', it will short-circuit return success to
+// enable a CI fastpath for PRs that are known not to need a full CI test.
+def SKIPTESTS
+// Make a note of when we did do the check, so we can warn when we cannot
+// do it (probalby due to lack of set env vars)
+def DID_SKIPTEST = 'false'
+// The github label we look for. If found, we skip the main body of the
+// CI checks.
+def SKIPLABEL='skip-ci'
+
+pipeline {
+
+  // Set the node to 'none' at the global level, so we can then allocate
+  // specific nodes to specific steps later on. This allows us to run any
+  // fast lightweight steps on the master (to save spinning up a container
+  // or VM node), and also to use specific nodes for specific tests, such
+  // as distro or arch specific tests.
+  agent none
+
+  // Set up some required environment vars
+  environment {
+    // Golang variables:
+    GOPATH="${WORKSPACE}/go"
+    // FIXME - how do we edit the PATH ??
+    //PATH="${GOPATH}/bin:/usr/local/go/bin:/usr/sbin:/sbin:${env.PATH}"
+
+    // Kata related variables:
+    CI="true"
+    // We need the tests repo to run the CI scripts
+    tests_repo="github.com/kata-containers/tests"
+    tests_repo_dir="${GOPATH}/src/${tests_repo}"
+    // We need the runtime repo to get the latest kata versions.yaml file to ensure
+    // we install and test with the required tool versions.
+    runtime_repo="github.com/kata-containers/runtime"
+    runtime_repo_dir="${GOPATH}/src/${runtime_repo}"
+  
+    // This has to be a string, so cannot be placed in a global var :-(
+    GITHUB_API_TOKEN = credentials('cc70853d-7fac-4976-be2d-093d7d366fb1')
+  }
+
+  stages {
+    // Do some prechecks. Check that we really do need to run the CI tests on this
+    // PR.
+    stage('Prechecks') {
+      // Run these checks on the Master node. This saves us having to spin up a
+      // node container or VM, so saves us time and resource.
+      agent { label "master" }
+      when {
+        // If none of these are set, then we can't do the curl to get the list of
+        // github labels. Currently we then fall through, warn we have not done the
+        // check, and then run the CI. We *could* skip the CI in this situation if
+        // we wanted to...
+        allOf {
+          expression { GITHUB_API_TOKEN != null }
+          expression { env.ghprbGhRepository != null }
+          expression { env.ghprbPullId != null }
+        }
+      }
+      steps {
+        script {
+          DID_SKIPTEST='true'
+          // Curl the github labels for this PR (the ghprb plugin does not supply them directly),
+          // and then check if we have the 'fast track the CI' label set.
+          json=sh(script: "/usr/bin/curl -H \"Authorization: Basic ${GITHUB_API_TOKEN}\" https://api.github.com/repos/${env.ghprbGhRepository}/issues/${env.ghprbPullId}/labels", returnStdout: true).trim()
+
+          // Convert the labels JSON to a list of maps, one map per label
+          labs = readJSON text: "${json}"
+          // Check if we have the 'skip the CI' label applied
+          labs.each { labmap ->
+            if ( labmap['name'] == SKIPLABEL ) {
+              echo "Found CI skip label, skipping further tests"
+              SKIPTESTS='true'
+            }
+          }
+          if ( SKIPTESTS != 'true' ) {
+            echo "CI fastpath not set, running full pipeline"
+          }
+        }
+      }
+    }
+
+    // Warn when we failed to do the precheck. This is not idea, as it will appear
+    // as an extra stage. it would be great if the above 'when' check had an 'else'
+    // clause we could use, but afaict, it does not.
+    stage('CheckPrecheck') {
+      agent { label "master" }
+      when {
+        expression { DID_SKIPTEST == 'false' }
+      }
+      steps {
+        echo "Warning, skipped CI skip check"
+      }
+    }
+    
+    // First, run the static checks. If the PR does not pass the static checks,
+    // then the rest of the CI checks will be skipped by Jenkins.
+    stage('Static checks') {
+      when {
+        expression { SKIPTESTS != 'true' }
+      }
+      agent { label "master" }
+      steps {
+        script {
+          echo "In static check"
+        }
+      }
+    }
+
+    // Run the CI on the primary distro (note, that does not mean this is our
+    // favoured distro, it just means we needed to pick one as the primary
+    // smoke test). If the primary distro does not pass, the rest of the distro
+    // tests will be skipped by Jenkins.
+    stage('Primary distro') {
+      when {
+        expression { SKIPTESTS != 'true' }
+      }
+      agent { label "master" }
+      steps {
+        echo "Am running primary distro test"
+      }
+    }
+
+    // If we have passed all previous steps, finally we can parallel run the
+    // rest of the distro checks.
+    stage('Run main jobs') {
+      when {
+        expression { SKIPTESTS != 'true' }
+      }
+      parallel {
+        stage('Secondary distro1') {
+          agent { label "master" }
+          steps {
+            echo "Am running secondary distro1 test"
+          }
+        }
+        stage('Secondary distro2') {
+          agent { label "master" }
+          steps {
+            echo "Am running secondary distro2 test"
+          }
+        }
+      }
+    }
+  }
+}
+
